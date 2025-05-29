@@ -217,17 +217,17 @@ class RLHFArguments(GRPOArguments, PPOArguments, RewardModelArguments, TrainArgu
     def _check_grpo(self):
         if self.rlhf_type != 'grpo':
             return
-
         from packaging import version
+
         import trl
         trl_version = version.parse(trl.__version__)
         assert trl_version >= version.parse('0.17'), ('Your current version of `trl` is outdated. '
                                                       'Please update it by running: pip install -U trl')
 
-        if self.num_generations < 2:
-            raise ValueError(
-                'GRPO requires at least 2 generations per prompt to calculate the advantages. You provided '
-                f'{self.num_generations}, which is less than the minimum required.')
+        if self.use_liger_kernel:
+            from trl.import_utils import is_liger_kernel_available
+            assert is_liger_kernel_available(), (
+                'Please install/update liger-kernel by running: pip install -U liger-kernel')
 
         if self.vllm_mode == 'server':
             assert not self.use_vllm or self.vllm_server_host is not None
@@ -243,6 +243,12 @@ class RLHFArguments(GRPOArguments, PPOArguments, RewardModelArguments, TrainArgu
 
         if self.async_generate and self.multi_turn_func is not None:
             raise NotImplementedError('Currently, async_generate is not supported with multi-turn functionality.')
+
+        if self.generation_batch_size or self.steps_per_generation:
+            from trl.trainer.grpo_config import GRPOConfig
+            assert 'generation_batch_size' in GRPOConfig.__dict__, (
+                'generation_batch_size or steps_per_generation needs trl >= 0.18.dev, '
+                'please install trl from source `pip install git+https://github.com/huggingface/trl.git')
 
     def _external_vllm_warning(self):
         if self.rlhf_type != 'grpo' or not self.vllm_server_host:

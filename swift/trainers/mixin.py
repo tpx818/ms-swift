@@ -26,14 +26,14 @@ from transformers.data.data_collator import DataCollator
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.modeling_utils import unwrap_model
 from transformers.trainer import TrainerCallback
-from transformers.trainer_utils import EvalPrediction, IntervalStrategy, seed_worker
+from transformers.trainer_utils import EvalPrediction, IntervalStrategy
 from transformers.utils import is_torch_npu_available
 
 from swift.hub import get_hub
 from swift.llm import BatchSamplerShard, DataLoaderDispatcher, DataLoaderShard, Template
 from swift.plugin import MeanMetric, compute_acc, extra_tuners
 from swift.tuners import SwiftModel
-from swift.utils import get_logger, is_mp_ddp, use_torchacc
+from swift.utils import get_logger, is_mp_ddp, seed_worker, use_torchacc
 from swift.utils.torchacc_utils import ta_trim_graph
 from ..utils.torch_utils import get_device_count
 from .arguments import TrainingArguments
@@ -313,6 +313,35 @@ class SwiftMixin:
         finally:
             Accelerator.clip_grad_norm_ = origin_clip_grad_norm_
 
+    def _prepare_gradient_checkpointing(self, model) -> None:
+        from swift.llm import HfConfigFactory, get_model_arch, deep_getattr, dynamic_gradient_checkpointing
+        args = self.args
+        if args.gradient_checkpointing or args.vit_gradient_checkpointing:
+            HfConfigFactory.set_model_config_attr(model, 'use_cache', False)
+            dynamic_gradient_checkpointing(model, args.vit_gradient_checkpointing)
+        if args.gradient_checkpointing:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
+            model.enable_input_require_grads()
+
+        model_meta = model.model_meta
+        model_arch = get_model_arch(model_meta.model_arch)
+        if model_meta.is_multimodal and model_arch:
+            for vision_tower_name in model_arch.vision_tower:
+                vision_tower = deep_getattr(model, vision_tower_name)
+                if hasattr(vision_tower, 'enable_input_require_grads'):
+                    try:
+                        if args.vit_gradient_checkpointing:
+                            vision_tower.gradient_checkpointing_enable(
+                                gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
+                            vision_tower.enable_input_require_grads()
+                        else:
+                            vision_tower.gradient_checkpointing_disable()
+                            vision_tower.disable_input_require_grads()
+                    except (NotImplementedError, AttributeError):
+                        pass
+        # Avoid vit_gradient_checkpointing being overwritten by transformers.Trainer.gradient_checkpointing_enable.
+        self.args.gradient_checkpointing = False
+
     def train(self, *args, **kwargs):
         if self.model_meta.is_multimodal:
             models = []
@@ -332,9 +361,14 @@ class SwiftMixin:
             self.template.register_post_encode_hook(models)
             logger.info(f'Successfully registered post_encode hook: {[model.__class__.__name__ for model in models]}.')
         self._save_initial_model(self.args.output_dir)
+
+        # gradient_checkpointing
+        gradient_checkpointing = self.args.gradient_checkpointing
+        self._prepare_gradient_checkpointing(self.accelerator.unwrap_model(self.model))
         with self.hub.patch_hub(), self._fix_grad_norm_nan():
             res = super().train(*args, **kwargs)
         self.template.remove_post_encode_hook()
+        self.args.gradient_checkpointing = gradient_checkpointing  # recover
         return res
 
     def push_to_hub(self, *args, **kwargs):
@@ -452,7 +486,9 @@ class SwiftMixin:
 
     def get_batch_samples(self, *args, **kwargs):
         res = super().get_batch_samples(*args, **kwargs)
-        if self.template.sequence_parallel_size == 1:
+        from swift.trainers.sequence_parallel import sequence_parallel
+        if self.template.sequence_parallel_size == 1 or 'Ulysses' == sequence_parallel.__class__.__name__:
+            # ulysses split inputs in the model hook, so no need to gather num_items_in_batch
             return res
 
         batch_samples, num_items_in_batch = res
@@ -493,7 +529,8 @@ class DataLoaderMixin:
             if hasattr(train_dataset, '__len__'):
                 batch_sampler = BatchSamplerShard(
                     len(train_dataset), batch_size=self._train_batch_size, **batch_sampler_params)
-                dataloader_params['worker_init_fn'] = seed_worker
+                dataloader_params['worker_init_fn'] = partial(
+                    seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index)
                 dataloader_params['batch_sampler'] = batch_sampler
                 dataloader = DataLoaderShard(train_dataset, device=self.accelerator.device, **dataloader_params)
             else:

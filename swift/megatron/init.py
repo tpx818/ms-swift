@@ -10,13 +10,22 @@ logger = get_logger()
 
 
 def _patch_transformer_engine():
+    import transformer_engine
     try:
-        from transformer_engine.pytorch.attention import FusedRoPEFunc
+        from transformer_engine.pytorch.attention import apply_rotary_pos_emb
     except ImportError:
         try:
-            import transformer_engine
-            transformer_engine.pytorch.attention.FusedRoPEFunc = (
-                transformer_engine.pytorch.dot_product_attention.rope.FusedRoPEFunc)
+            transformer_engine.pytorch.attention.apply_rotary_pos_emb = (
+                transformer_engine.pytorch.attention.rope.apply_rotary_pos_emb)
+            logger.info('Patch apply_rotary_pos_emb successfully applied.')
+        except (ImportError, AttributeError):
+            pass
+    try:
+        from transformer_engine.pytorch.attention import _SplitAlongDim
+    except ImportError:
+        try:
+            transformer_engine.pytorch.attention._SplitAlongDim = (transformer_engine.pytorch.utils.SplitAlongDim)
+            logger.info('Patch _SplitAlongDim successfully applied.')
         except (ImportError, AttributeError):
             pass
 
@@ -65,9 +74,22 @@ def _patch_max_epochs():
     training.cyclic_iter = new_cyclic_iter
 
 
+def _patch__batched_p2p_ops():
+    from megatron.core.pipeline_parallel import p2p_communication
+
+    _batched_p2p_ops_origin = p2p_communication._batched_p2p_ops
+
+    def _batched_p2p_ops(**kwargs):
+        kwargs['group'] = None
+        return _batched_p2p_ops_origin(**kwargs)
+
+    p2p_communication._batched_p2p_ops = _batched_p2p_ops
+
+
 def _patch_megatron():
     _patch_transformer_engine()
     _patch_max_epochs()
+    _patch__batched_p2p_ops()
 
 
 def init_megatron_env() -> None:

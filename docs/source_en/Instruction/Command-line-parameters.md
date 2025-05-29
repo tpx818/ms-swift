@@ -78,8 +78,7 @@ Hints:
 - 🔥max_pixels: The maximum number of pixels (H*W) for input images to a multimodal model. Images exceeding this limit will be scaled. Default is None, meaning no maximum pixel limit.
 - 🔥agent_template: Agent template, which determines how to convert the list of tools into a system, how to extract tool calls from the model's response, and specifies the template format for `{"role": "tool_call", "content": "xxx"}` and `{"role": "tool_response", "content": "xxx"}`. Optional values include "react_en", "hermes", "glm4", "qwen_en", "toolbench", etc. For more details, please check [here](https://github.com/modelscope/ms-swift/blob/main/swift/plugin/agent_template/__init__.py). The default value is None, meaning it will be selected based on the model type.
 - norm_bbox: Controls how to scale bounding boxes (bbox). Options are 'norm1000' and 'none'. 'norm1000' represents scaling bbox coordinates to one-thousandths, and 'none' means no scaling. Default is None, automatically selected based on the model.
-- response_prefix: The prefix character for the response, for example, setting the response_prefix to `'<think>\n'` for QwQ-32B. The default is None, and it is automatically set according to the model.
-  - Note: If you are training the deepseek-r1/qwq model with a dataset that does not include `<think>...</think>`, please pass `--response_prefix ''` additionally when inferring after training.
+- use_chat_template: Use chat template or generation template, default is `True`. `swift pt` is automatically set to the generation template.
 - 🔥padding_free: Flattens the data in a batch to avoid padding, thereby reducing memory usage and accelerating training. Default is False. Currently supports `swift pt/sft`.
   - Note: When using `padding_free`, it should be combined with `--attn_impl flash_attn` and "transformers>=4.44". For details, see [this PR](https://github.com/huggingface/transformers/pull/31629). (Same as packing)
   - The supported multimodal models are the same as those supported for multimodal packing. Compared to packing, padding_free does not consume additional time or space.
@@ -91,7 +90,8 @@ Hints:
   - 'ignore_empty_think': On top of 'default', ignore the loss calculation for empty `'<think>\n\n</think>\n\n'`. See [this issue](https://github.com/modelscope/ms-swift/issues/4030) for more details.
   - `'react'`, `'hermes'`, `'qwen'`: On top of `'default'`, set the loss weight of the `tool_call` part to 2.
 - sequence_parallel_size: Sequence parallelism size, default is 1. Currently supported in pt/sft/dpo. The training script refers to [here](https://github.com/modelscope/ms-swift/tree/main/examples/train/long_text/sequence_parallel.sh).
-- use_chat_template: Use chat template or generation template, default is `True`. `swift pt` is automatically set to the generation template.
+- response_prefix: The prefix character for the response, for example, setting the response_prefix to `'<think>\n'` for QwQ-32B. The default is None, and it is automatically set according to the model.
+  - Note: If you are training the deepseek-r1/qwq model with a dataset that does not include `<think>...</think>`, please pass `--response_prefix ''` additionally when inferring after training.
 - template_backend: Selection of the template backend. Options are 'swift' and 'jinja', with 'swift' as the default. If using jinja, it applies transformer's `apply_chat_template`.
   - Note: The jinja template backend supports only inference, not training.
 
@@ -133,6 +133,8 @@ This parameter list inherits from transformers `Seq2SeqTrainingArguments`, with 
 
 - 🔥output_dir: Defaults to None, set as `output/<model_name>`.
 - 🔥gradient_checkpointing: Whether to use gradient checkpointing, default is True.
+- 🔥vit_gradient_checkpointing: Whether to enable gradient_checkpointing for the vit part during multi-modal model training. Defaults to None, meaning it is set to `gradient_checkpointing`. For an example, please refer to [here](https://github.com/modelscope/ms-swift/blob/main/examples/train/multimodal/vit_gradient_checkpointing.sh).
+  - Note: For multimodal models using LoRA training, when `--freeze_vit false` is set and the following warning appears in the command line: `UserWarning: None of the inputs have requires_grad=True. Gradients will be None`, please set `--vit_gradient_checkpointing false`, or raise a related issue. This problem does not occur during full-parameter training.
 - 🔥deepspeed: Defaults to None. It can be set to 'zero0', 'zero1', 'zero2', 'zero3', 'zero2_offload', 'zero3_offload' to use the built-in deepspeed configuration file of ms-swift.
 - zero_hpz_partition_size: Default is `None`. This parameter is a feature of `ZeRO++`, which implements model sharding within nodes and data sharding between nodes. If you encounter grad_norm `NaN` issues, please try using `--torch_dtype float16`
 - 🔥per_device_train_batch_size: Default is 1.
@@ -167,7 +169,7 @@ Other important parameters:
 - 🔥warmup_ratio: Default is 0.
 - save_on_each_node: Default is False. Should be considered in multi-node training.
 - save_only_model: Whether to save only the model weights without including optimizer state, random seed state, etc. Default is False.
-- 🔥resume_from_checkpoint: Parameter for resuming training from a checkpoint, pass the checkpoint path. Default is None.
+- 🔥resume_from_checkpoint: Parameter for resuming training from a checkpoint, pass the checkpoint path. Default is None. For resuming training from a checkpoint, keep other parameters unchanged and add `--resume_from_checkpoint checkpoint_dir` additionally.
   - Note: `resume_from_checkpoint` will load the model weights, optimizer weights, and random seed, and continue training from the last trained steps. You can specify `--resume_only_model` to load only the model weights.
 - 🔥ddp_find_unused_parameters: Default is None.
 - 🔥dataloader_num_workers: Defaults to None. If the platform is Windows, it is set to 0; otherwise, it is set to 1.
@@ -188,6 +190,7 @@ Other important parameters:
 
 - 🔥freeze_llm: This parameter is only effective for multimodal models and can be used for full parameter training and LoRA, but with different meanings. In full parameter training, setting freeze_llm to True will freeze some of the LLM weights. In LoRA training, if `target_modules` is set to 'all-linear', setting freeze_llm to True will prevent adding LoRA modules to the LLM part. The default is False.
 - 🔥freeze_vit: This parameter is only effective for multimodal models and can be used for full parameter training and LoRA, with similar meanings as `freeze_llm`. The default is True.
+  - Note: Here, "vit" refers not only to the vision_tower but also includes the audio_tower.
 - 🔥freeze_aligner: This parameter is only effective for multimodal models and can be used for full parameter training and LoRA, with similar meanings as `freeze_llm`. The default is True.
 - 🔥target_modules: Specifies LoRA modules, with a default of `all-linear`. Its behavior differs in LLM and multimodal LLM. For LLM, it automatically finds all linear modules except lm_head and adds a tuner. For multimodal LLM, by default, it only adds a tuner to the LLM part, and this behavior can be controlled by `freeze_llm`, `freeze_vit`, and `freeze_aligner`. This parameter is not limited to LoRA and can be used for other tuners.
 - 🔥target_regex: Specifies a regex expression for LoRA modules, with a default of `None`. If this value is provided, the target_modules parameter becomes ineffective. This parameter is not limited to LoRA and can be used for other tuners.
@@ -332,12 +335,13 @@ Parameter meanings can be found in the [vllm documentation](https://docs.vllm.ai
 - pipeline_parallel_size: Default is `1`.
 - max_num_seqs: Default is `256`.
 - 🔥max_model_len: Default is `None`.
-- disable_custom_all_reduce: Default is `False`.
+- disable_custom_all_reduce: Default is `True`.
 - enforce_eager: Determines whether vllm uses PyTorch eager mode or constructs a CUDA graph, default is `False`. Setting it to True can save memory but may affect efficiency.
 - 🔥limit_mm_per_prompt: Controls the use of multiple media in vllm, default is `None`. For example, you can pass in `--limit_mm_per_prompt '{"image": 5, "video": 2}'`.
 - vllm_max_lora_rank: Default is `16`. This is the parameter supported by vllm for lora.
-- - vllm_quantization: vllm is able to quantize model with this argument，supported values can be found [here](https://docs.vllm.ai/en/latest/serving/engine_args.html).
+- vllm_quantization: vllm is able to quantize model with this argument，supported values can be found [here](https://docs.vllm.ai/en/latest/serving/engine_args.html).
 - enable_prefix_caching: Enable the automatic prefix caching of vllm to save processing time for querying repeated prefixes. The default is `False`.
+- use_async_engine: Whether to use the async engine under the vLLM backend. The deployment status (swift deploy) defaults to True, and other statuses default to False.
 
 ### Merge Arguments
 
@@ -420,7 +424,9 @@ The meanings of the following parameters can be referenced [here](https://huggin
 #### GRPO Arguments
 - per_device_train_batch_size: The training batch size per device. In GRPO, this refers to the batch size of completions during training.
 - per_device_eval_batch_size: The evaluation batch size per device. In GRPO, this refers to the batch size of completions during evaluation.
-- num_generations: The number of samples for each prompt, referred to as the G value in the paper, needs to be divisible by per_device_batch_size * - gradient_accumulation_steps * nproc_per_node, default is 8.
+- generation_batch_size: Batch size to use for generation. It defaults to the effective training batch size: per_device_train_batch_size * num_processes * gradient_accumulation_steps`
+- steps_per_generation: Number of optimization steps per generation. It defaults to gradient_accumulation_steps. This parameter and generation_batch_size cannot be set simultaneously
+- num_generations: The number of samples for each prompt, referred to as the G value in the paper, needs to be divisible by per_device_batch_size * - gradient_accumulation_steps * num_processes, default is 8.
 - max_completion_length: The maximum generation length in the GRPO algorithm, default is 512.
 - ds3_gather_for_generation: This parameter applies to DeepSpeed ZeRO-3. If enabled, the policy model weights are gathered for generation, improving generation speed. However, disabling this option allows training models that exceed the VRAM capacity of a single GPU, albeit at the cost of slower generation. Disabling this option is not compatible with vLLM generation. The default is True.
 - reward_funcs: Reward functions in the GRPO algorithm; options include `accuracy`,`format`,`cosine` and `repetition`, as seen in `swift/plugin/orm.py`. You can also customize your own reward functions in the plugin. Default is `[]`.
@@ -445,6 +451,14 @@ The meanings of the following parameters can be referenced [here](https://huggin
   - vllm_limit_mm_per_prompt: vLLM passthrough parameter, default is None.
   - vllm_tensor_parallel_size: the tensor parallel size of vLLM engine, default is 1.
   - sleep_level: make vllm sleep when model is training. Options are 0 or 1, default is 0, no sleep
+  - move_model_batches: When moving model parameters to fast inference frameworks such as vLLM/LMDeploy, determines how many batches to divide the layers into. The default is `None`, which means the entire model is not split. Otherwise, the model is split into `move_model_batches + 1` (non-layer parameters) + `1` (multi-modal component parameters) batches.
+  - offload_optimizer: Whether to offload optimizer parameters during inference with vLLM/LMDeploy. The default is `False`.
+  - offload_model: Whether to offload the model itself during inference with vLLM/LMDeploy. The default is `False`.
+  - gc_collect_after_offload: Whether to perform garbage collection (both Python GC and GPU GC) after offloading. The default is `False`.
+  - completion_length_limit_scope: Specifies the scope of the `max_completion_length` limit in multi-turn conversations.
+  When set to `total`, the total output length across all turns must not exceed `max_completion_length`.
+  When set to `per_round`, each individual turn's output length is limited separately.
+  Defaults to `per_round`. Currently only takes effect in colocate mode.
 - top_k: Default is 50.
 - top_p: Default is 0.9.
 - repetition_penalty: Repetition penalty term. Default is 1.
@@ -454,15 +468,7 @@ The meanings of the following parameters can be referenced [here](https://huggin
 - sync_ref_model: Whether to synchronize the reference model. Default is False。
   - ref_model_mixup_alpha: The Parameter controls the mix between the current policy and the previous reference policy during updates. The reference policy is updated according to the equation: $π_{ref} = α * π_θ + (1 - α) * π_{ref_{prev}}$. Default is 0.6.
   - ref_model_sync_steps：The parameter determines how frequently the current policy is synchronized with the reference policy. Default is 512.
-- move_model_batches: When moving model parameters to fast inference frameworks such as vLLM/LMDeploy, determines how many batches to divide the layers into. The default is `None`, which means the entire model is not split. Otherwise, the model is split into `move_model_batches + 1` (non-layer parameters) + `1` (multi-modal component parameters) batches.
-- offload_optimizer: Whether to offload optimizer parameters during inference with vLLM/LMDeploy. The default is `False`.
-- offload_model: Whether to offload the model itself during inference with vLLM/LMDeploy. The default is `False`.
-- gc_collect_after_offload: Whether to perform garbage collection (both Python GC and GPU GC) after offloading. The default is `False`.
 - multi_turn_func: The multi turn GRPO plugin name. Add your multi-turn implementation in plugin/multi_turn.py.
-- completion_length_limit_scope: Specifies the scope of the `max_completion_length` limit in multi-turn conversations.
-When set to `total`, the total output length across all turns must not exceed `max_completion_length`.
-When set to `per_round`, each individual turn's output length is limited separately.
-Defaults to `per_round`. Currently only takes effect in colocate mode.
 - dynamic_sample: Exclude data within the group where the reward standard deviation is 0, and additionally sample new data. Default is False.
 - max_resample_times: Under the dynamic_sample setting, limit the number of resampling attempts to a maximum of 3. Default is 3 times.
 - overlong_filter: Skip overlong truncated samples, which will not be included in loss calculation. Default is False.
@@ -499,8 +505,9 @@ Soft overlong reward parameters:
 Inference arguments include the [base arguments](#base-arguments), [merge arguments](#merge-arguments), [vLLM arguments](#vllm-arguments), [LMDeploy arguments](#LMDeploy-arguments), and also contain the following:
 
 - 🔥infer_backend: Inference acceleration backend, supporting three inference engines: 'pt', 'vllm', and 'lmdeploy'. The default is 'pt'.
-- 🔥max_batch_size: Effective when infer_backend is set to 'pt'; used for batch inference, with a default value of 1.
+- 🔥max_batch_size: Effective when infer_backend is set to 'pt'; used for batch inference, with a default value of 1. If set to -1, there is no restriction.
 - 🔥result_path: Path to store inference results (jsonl). The default is None, meaning results are saved in the checkpoint directory (with args.json file) or './result' directory. The final storage path will be printed in the command line.
+- write_batch_size: The batch size for writing results to result_path. Defaults to 1000. If set to -1, there is no restriction.
 - metric: Evaluate the results of the inference, currently supporting 'acc' and 'rouge'. The default is None, meaning no evaluation is performed.
 - val_dataset_sample: Number of samples from the inference dataset, default is None.
 
@@ -517,8 +524,6 @@ Deployment Arguments inherit from the [inference arguments](#inference-arguments
   - Note: In `swift app` or `swift eval`, the default is False.
 - log_interval: Interval for printing tokens/s statistics, default is 20 seconds. If set to -1, it will not be printed.
 - max_logprobs: Maximum number of logprobs returned to the client, with a default value of 20.
-- use_async_engine: Whether to use the async engine under the vLLM backend. Default is True.
-
 
 ### Web-UI Arguments
 - server_name: Host for the web UI, default is '0.0.0.0'.
