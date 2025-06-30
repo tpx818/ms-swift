@@ -619,7 +619,7 @@ class ToolUseCorrectnessReward(ORM):
                     else:
                         continue
 
-                pd_params = pd_tool['parameters']
+                pd_params = pd_tool.get('parameters', {})
                 param_score = self.match_score(list(gt_params.keys()), list(pd_params.keys()))
 
                 # Calculate correctness score for parameter values
