@@ -602,9 +602,11 @@ class ActivationCpuOffloadCallBack(TrainerCallback):
                 # Check if fsdp_config is a dictionary and has activation_cpu_offload enabled
                 if isinstance(fsdp_config, dict) and fsdp_config.get('activation_cpu_offload', False):
                     # Get FSDP version from fsdp_config
-                    strategy = fsdp_config.get('fsdp_version', None)
+                    strategy = fsdp_config.get('version', None)
                     if strategy is not None:
                         fsdp_version = 'fsdp' if strategy == 1 else 'fsdp2'
                         # Get activation checkpointing setting from fsdp_config
                         enable_ckpt = fsdp_config.get('activation_checkpointing', False)
+                        if enable_ckpt and hasattr(model, 'enable_input_require_grads'):
+                            model.enable_input_require_grads()                        
                         enable_activation_offloading(model, strategy=fsdp_version, enable_ckpt=enable_ckpt)
