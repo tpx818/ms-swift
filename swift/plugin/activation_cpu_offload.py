@@ -608,5 +608,5 @@ class ActivationCpuOffloadCallBack(TrainerCallback):
                         # Get activation checkpointing setting from fsdp_config
                         enable_ckpt = fsdp_config.get('activation_checkpointing', False)
                         if enable_ckpt and hasattr(model, 'enable_input_require_grads'):
-                            model.enable_input_require_grads()                        
+                            model.enable_input_require_grads()
                         enable_activation_offloading(model, strategy=fsdp_version, enable_ckpt=enable_ckpt)
