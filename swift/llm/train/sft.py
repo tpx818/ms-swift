@@ -276,7 +276,9 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                 model=self.model)
             lisa_callback.switch_active_layers()  # Make trainable parameters printing a correct value
             callbacks.append(lisa_callback)
-        if self.args.activation_cpu_offload:
+        # Check activation_cpu_offload from fsdp_config
+        fsdp_config = getattr(self.args, 'fsdp_config', {})
+        if isinstance(fsdp_config, dict) and fsdp_config.get('activation_cpu_offload', False):
             callbacks.append(ActivationCpuOffloadCallBack())
 
         if args.is_adapter and args.train_type == 'adalora':

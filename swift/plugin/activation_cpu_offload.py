@@ -18,10 +18,6 @@ from swift.utils import get_logger
 logger = get_logger()
 logger.setLevel(logging.WARNING)
 
-__all__ = ['get_cpu_offload_context']
-
-CPUOffloadEnabled = False
-
 
 def is_torch_npu_available() -> bool:
     """Check the availability of NPU"""
@@ -35,11 +31,6 @@ def is_torch_npu_available() -> bool:
 
 is_cuda_available = torch.cuda.is_available()
 is_npu_available = is_torch_npu_available()
-
-
-def is_cpu_offload_enabled() -> bool:
-    """Check if CPU offloading is currently enabled."""
-    return CPUOffloadEnabled
 
 
 def _get_unique_tensor_key(tensor):
@@ -514,8 +505,6 @@ class ActivationHandler:
         binded_tensor = ret
         if isinstance(ret, tuple):
             binded_tensor = ret[0]
-        #即 GroupCommitFunction.apply，即调用算子GroupCommitFunction(binded_tensor),
-        # group_prefetch_offload_commit = GroupCommitFunction.apply
         binded_tensor = self._sync_func(binded_tensor)
         final_ret = binded_tensor
         if isinstance(ret, tuple):
@@ -534,7 +523,6 @@ class ActivationHandler:
             handler.post_forward(model_self)
             return out
 
-        #普通方法绑定为module 的方法，因此完成了原始module.forward的包裹
         module.forward = wrapped_method.__get__(module, type(module))
 
 
@@ -575,10 +563,10 @@ def enable_activation_offloading(model, strategy, enable_ckpt=False):
                 if not isinstance(wrapped_module, torch.nn.Embedding):
                     layers.append(child)
 
-    # get_layers(model)
-    # if len(layers) < 3:
-    #     logger.warning(f"Find only {len(layers)} fsdp layers, not neccessary to enable async activation offloading")
-    #     return
+    get_layers(model)
+    if len(layers) < 3:
+        logger.warning(f'Find only {len(layers)} fsdp layers, not neccessary to enable async activation offloading')
+        return
 
     tensor_filter = FSDPParameterFilter()
     context, sync_func = get_activation_offload_context(len(layers) - 1, len(layers), tensor_filter)
@@ -599,34 +587,6 @@ def enable_activation_offloading(model, strategy, enable_ckpt=False):
         handler.wrap_module_forward_method(module)
 
 
-def detect_fsdp_version() -> Optional[int]:
-    """
-    Detect the FSDP version used in the current environment.
-    """
-    try:
-        from accelerate import PartialState
-        state = PartialState()
-        plugin = getattr(state, 'fsdp_plugin', None)
-        if plugin is not None and hasattr(plugin, 'fsdp_version'):
-            return plugin.fsdp_version
-    except Exception:
-        pass
-
-    if os.environ.get('ACCELERATE_USE_FSDP', 'false').lower() == 'true':
-        return int(os.environ.get('FSDP_VERSION', '1'))
-
-    # try to detect fsdp version from torch.distributed.fsdp
-    try:
-        import torch.distributed.fsdp as fsdp
-        if hasattr(fsdp, 'fully_shard'):
-            return 2
-        return 1
-    except Exception:
-        pass
-
-    return None
-
-
 class ActivationCpuOffloadCallBack(TrainerCallback):
 
     def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
@@ -635,12 +595,16 @@ class ActivationCpuOffloadCallBack(TrainerCallback):
         """
         model = kwargs['model']
 
-        if args.activation_cpu_offload:
-            if (detect_fsdp_version() is None):
-                raise ValueError('Activation offloading only supports FSDP training strategy.')
-            strategy = detect_fsdp_version()
-            if strategy == 1:
-                strategy_str = 'fsdp'
-            else:
-                strategy_str = 'fsdp2'
-            enable_activation_offloading(model, strategy=strategy_str, enable_ckpt=args.gradient_checkpointing)
+        # Check if model is wrapped with FSDP
+        if isinstance(model, FSDP) or isinstance(model, FSDP2):
+            if args is not None and hasattr(args, 'fsdp_config'):
+                fsdp_config = args.fsdp_config
+                # Check if fsdp_config is a dictionary and has activation_cpu_offload enabled
+                if isinstance(fsdp_config, dict) and fsdp_config.get('activation_cpu_offload', False):
+                    # Get FSDP version from fsdp_config
+                    strategy = fsdp_config.get('fsdp_version', None)
+                    if strategy is not None:
+                        fsdp_version = 'fsdp' if strategy == 1 else 'fsdp2'
+                        # Get activation checkpointing setting from fsdp_config
+                        enable_ckpt = fsdp_config.get('activation_checkpointing', False)
+                        enable_activation_offloading(model, strategy=fsdp_version, enable_ckpt=enable_ckpt)
