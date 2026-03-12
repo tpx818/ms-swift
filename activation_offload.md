@@ -300,25 +300,253 @@ classDiagram
   SynchronizedGroupOffloadHandler <|-- AsyncDoubleBufferGroupOffloadHandler
 ```
 
-## 12. 复杂度、收益与代价
+## 12. 关键类伪代码与流程图
 
-### 12.1 预期收益
+### 12.1 `CpuOffloadHookWithOffloadHandler`
+
+该类是机制层的最薄封装，负责安装/卸载 saved-tensor hooks，并把保存与取回动作转发给 handler。
+
+```text
+class CpuOffloadHookWithOffloadHandler:
+    enter():
+        push_saved_tensor_hooks(save_hook=on_save_for_backward,
+                                load_hook=on_get_saved_tensor)
+
+    exit():
+        pop_saved_tensor_hooks()
+
+    on_save_for_backward(tensor):
+        tag = offload_handler.tensor_push(tensor)
+        return tag
+
+    on_get_saved_tensor(saved_state):
+        tensor = offload_handler.tensor_pop(saved_state)
+        return tensor
+```
+
+其核心逻辑只有两步：forward 时把原 tensor 替换为 tag，backward 时根据 tag 恢复 tensor。
+
+### 12.2 `SynchronizedGroupOffloadHandler`
+
+该类提供最直接的同步基线实现。张量在 save 阶段立即拷到 CPU，在 load 阶段立即拷回原 device。
+
+```text
+class SynchronizedGroupOffloadHandler:
+    tensor_push(tensor):
+        tag = (current_group, tensor_count_current_group)
+        tensor_count_current_group += 1
+
+        if current_group < num_offload_group and tensor_need_offloading_checker(tensor):
+            cpu_state = offload_to_cpu(tensor)
+            tensor_tag_to_state[tag] = cpu_state
+        else:
+            tensor_tag_to_state[tag] = tensor
+
+        return tag
+
+    tensor_pop(tag):
+        state = tensor_tag_to_state.pop(tag)
+        if state is an offloaded cpu backup:
+            return reload_to_device(state)
+        return state
+
+    on_group_commit_forward():
+        current_group += 1
+        tensor_count_current_group = 0
+
+    on_group_commit_backward():
+        current_group -= 1
+```
+
+这一路径的优势是逻辑简单、正确性容易验证；不足是 D2H/H2D 拷贝直接落在关键路径上。
+
+### 12.3 `AsyncDoubleBufferGroupOffloadHandler`
+
+该类是主要性能实现。其关键思想是先登记 tensor，再在 group commit 时批量 offload/reload，并利用 `d2h_stream` 与 `h2d_stream` 与计算重叠。
+
+```text
+class AsyncDoubleBufferGroupOffloadHandler:
+    tensor_push(tensor):
+        if tensor should not be offloaded:
+            return tensor
+
+        tag = (current_group, tensor_count_current_group)
+        tensor_count_current_group += 1
+        tensor_tag_to_state[tag] = tensor
+
+        if current_group < num_offload_group:
+            tensor_tag_to_buf[tag] = tensor
+        return tag
+
+    bulk_offload_group(group_id):
+        for each tensor_tag in target group:
+            key = unique_storage_key(tensor)
+            save deduplicated tensor into offload_mapping[key]
+            tensor_tag_to_state[tensor_tag] = (key, shape)
+
+        for each key in offload_mapping:
+            offload_mapping[key] = offload_to_cpu(offload_mapping[key])
+
+        group_offload_mapping[group_id] = offload_mapping
+
+    on_group_commit_forward():
+        if current_group reaches offload window:
+            synchronize compute stream and d2h_stream as needed
+            release gpu references of an older group
+            bulk_offload_group(next_group)
+            offloaded_group_count += 1
+
+        current_group += 1
+        tensor_count_current_group = 0
+
+    bulk_reload_group(group_id):
+        for each cpu_state in group_offload_mapping[group_id]:
+            gpu_tensor = reload_to_device(cpu_state)
+        for each tensor_tag in target group:
+            tensor_tag_to_state[tensor_tag] = restored_gpu_tensor_view
+
+    on_group_commit_backward():
+        current_group -= 1
+        if current_group reaches reload window:
+            synchronize compute stream and h2d_stream as needed
+            bulk_reload_group(previous_offloaded_group)
+            update offloaded_group_count
+
+    tensor_pop(tag):
+        if tag is already a tensor:
+            return tag
+        tensor = tensor_tag_to_state.pop(tag)
+        tensor_tag_to_buf.pop(tag, None)
+        return tensor
+```
+
+这里最重要的不是某个单独函数，而是四个状态变量之间的配合：`tensor_tag_to_state` 负责逻辑状态，`tensor_tag_to_buf` 负责延迟释放 GPU 引用，`group_offload_mapping` 负责 CPU 副本索引，`offloaded_group_count` 负责时序推进。
+
+### 12.4 `ActivationHandler`
+
+`ActivationHandler` 负责把 hooks 与 commit 点真正嵌入被包裹层的 forward 生命周期中。
+
+```text
+class ActivationHandler:
+    pre_forward(module):
+        if module.training:
+            enter offload context
+            refresh parameter filter
+
+    forward(module, forward_method, *args, **kwargs):
+        if not module.training:
+            ret = forward_method(*args, **kwargs)
+        else if checkpoint is disabled:
+            ret = forward_method(*args, **kwargs)
+        else:
+            ret = checkpoint(forward_method, *args, **kwargs)
+
+        bind one tensor from ret
+        binded_tensor = sync_func(binded_tensor)
+        rebuild return value with committed tensor
+        return final_ret
+
+    post_forward(module):
+        if module.training:
+            exit offload context
+
+    wrap_module_forward_method(module):
+        replace module.forward with:
+            pre_forward()
+            out = forward(...)
+            post_forward()
+            return out
+```
+
+这一层决定了两个关键事实：只有 wrap 范围内的 saved tensor 会被接管，以及每一层 forward 结束后都会插入一个对称的 group commit。
+
+### 12.5 `ActivationHandler` 与 `AsyncDoubleBufferGroupOffloadHandler` 的关系
+
+两者并非同一层级的组件，而是“执行路径集成者”与“offload 调度执行者”的关系。
+
+- `ActivationHandler` 属于集成层。它不负责决定张量何时搬运，只负责把 offload 机制装配到每个被包裹模块的 forward 生命周期中，即在 layer forward 前进入 hook 上下文、在 forward 结束后插入 commit 点、并在结束时退出 hook 上下文。
+- `AsyncDoubleBufferGroupOffloadHandler` 属于策略层。它不负责修改模块执行路径，而是负责响应 hook 和 commit 信号，具体实现 `tensor_push`、`tensor_pop`、`bulk_offload_group`、`bulk_reload_group` 以及相关 stream 同步逻辑。
+
+两者之间的协作链路如下：
+
+1. `enable_activation_offloading` 先构造 `AsyncDoubleBufferGroupOffloadHandler`。
+2. 该 handler 被封装进 `CpuOffloadHookWithOffloadHandler`，形成 saved-tensor hook 上下文。
+3. 同时，系统构造绑定了该 handler 的 `sync_func`，其本质是 `GroupCommitFunction.apply`。
+4. `ActivationHandler` 持有上述 hook 上下文与 `sync_func`，并在每个被 wrap 的 layer forward 中驱动它们生效。
+5. 因此，`ActivationHandler` 负责提供“何时触发”的执行边界，`AsyncDoubleBufferGroupOffloadHandler` 负责处理“触发后如何搬运”的具体策略。
+
+如果没有 `ActivationHandler`，异步 handler 无法稳定地绑定到模型层级的 forward/backward 边界；如果没有异步 handler，`ActivationHandler` 只能建立 hooks 和 commit 点，却无法完成实际的 activation 搬运。
+
+### 12.6 `GroupCommitFunction`
+
+`GroupCommitFunction` 本身不改变张量数值；它的作用是在 autograd 图中插入一个 forward/backward 对称可见的“提交点”，让 handler 能在这两个时刻推进分组状态与同步逻辑。
+
+```text
+class GroupCommitFunction(autograd.Function):
+    forward(ctx, tensor, cpu_offload_handler):
+        cpu_offload_handler.on_group_commit_forward()
+        ctx.cpu_offload_handler = cpu_offload_handler
+        return tensor
+
+    backward(ctx, grad_output):
+        cpu_offload_handler = ctx.cpu_offload_handler
+        cpu_offload_handler.on_group_commit_backward()
+        return grad_output, None
+```
+
+可以把它理解为一种“零数值影响、只提供时序信号”的 dummy op。若没有这一层，handler 很难在 backward 侧以与 forward 对称的方式感知 layer/group 边界。
+
+### 12.7 关键类协同流程图
+
+下面的流程图强调 `ActivationHandler`、hook 和异步 handler 在一次 layer forward/backward 中的协作关系。
+
+```mermaid
+flowchart TD
+  A[Wrapped module.forward begins] --> B[ActivationHandler.pre_forward]
+  B --> C[Enter CpuOffloadHookWithOffloadHandler]
+  C --> D[Original forward executes]
+  D --> E{Operator calls save_for_backward}
+  E -- Yes --> F[Hook.on_save_for_backward]
+  F --> G[AsyncHandler.tensor_push]
+  G --> H[Store tag or keep tensor reference]
+  E -- No --> I[Continue forward]
+  H --> I
+  I --> J[ActivationHandler applies sync_func]
+  J --> K[GroupCommitFunction.forward]
+  K --> L[AsyncHandler.on_group_commit_forward]
+  L --> M[Maybe bulk_offload older group on d2h_stream]
+  M --> N[ActivationHandler.post_forward]
+
+  O[Backward reaches commit point] --> P[GroupCommitFunction.backward]
+  P --> Q[AsyncHandler.on_group_commit_backward]
+  Q --> R[Maybe bulk_reload target group on h2d_stream]
+  R --> S{Autograd requests saved tensor}
+  S -- Yes --> T[Hook.on_get_saved_tensor]
+  T --> U[AsyncHandler.tensor_pop]
+  U --> V[Return restored GPU tensor]
+  S -- No --> W[Continue backward]
+  V --> W
+```
+
+## 13. 复杂度、收益与代价
+
+### 13.1 预期收益
 
 - 降低 GPU 峰值 activation 显存。
 - 在固定显存预算下支持更大的 batch size、序列长度或模型规模。
 - 在层计算足够重、互连带宽充足时，异步方案能够将一部分传输开销隐藏在计算后面。
 
-### 12.2 主要代价
+### 13.2 主要代价
 
 - 额外消耗 CPU 内存以存放 activation 副本。
 - 增加 CPU-GPU 互连链路压力，PCIe 环境下可能成为瓶颈。
 - 引入额外的 stream 协调、group 调度和同步复杂度。
 
-### 12.3 性能边界
+### 13.3 性能边界
 
 该方案的有效性依赖 compute/transfer 比例。当单层计算时间显著大于对应 activation 的搬运时间时，异步 offload/reload 更容易被覆盖；反之，若模型层较浅、单层计算很短，或者 host-device 带宽较低，则性能收益会迅速下降，甚至可能退化为频繁同步等待。
 
-## 13. 局限性与后续工作
+## 14. 局限性与后续工作
 
 当前实现仍具有若干局限：
 
@@ -329,7 +557,7 @@ classDiagram
 
 若从性能收益与工程风险的平衡出发，下一阶段最值得优先实现的两项优化如下。
 
-### 13.1 按 Group 建立显式索引，消除 bulk 阶段的全表扫描
+### 14.1 按 Group 建立显式索引，消除 bulk 阶段的全表扫描
 
 当前异步实现中的 `bulk_offload_group` 与 `bulk_reload_group` 是通过遍历 `tensor_tag_to_state` 后筛选目标 `group_id` 来完成的。这种实现简单直接，但其调度开销会随着 saved tensor 总数增长而累积，导致 bulk 操作在 Python 侧产生额外线性扫描成本。更优的做法是显式维护 `group_id -> tensor_tags` 或 `group_id -> states` 的索引结构，使 offload、reload 与释放逻辑都能够直接按组访问。
 
@@ -339,7 +567,7 @@ classDiagram
 - 降低大模型、长序列或深层网络下的调度放大效应；
 - 为后续的 group 级 buffer packing、分组统计和事件管理提供更清晰的数据组织基础。
 
-### 13.2 以事件驱动替代部分 commit 点同步，减少主计算流阻塞
+### 14.2 以事件驱动替代部分 commit 点同步，减少主计算流阻塞
 
 当前实现中，forward 和 backward 的 group commit 阶段通过 `wait_stream` 在主计算流与拷贝流之间建立双向同步。这种设计便于保证正确性，但也可能过早暴露数据传输时延，使原本可被覆盖的 D2H/H2D 拷贝重新回到关键路径。更具性能潜力的方向是引入 event 驱动的依赖管理：仅在某组 activation 将被真正消费之前，再等待对应 offload 或 reload 完成，而不是在 commit 点统一等待。
 
@@ -351,6 +579,6 @@ classDiagram
 
 后续可考虑从三个方向推进：其一，引入基于 profile 的自适应分组与窗口调度；其二，补充运行时观测指标，支持自动选择 offload 粒度；其三，将当前设计推广到更多并行训练范式与异构设备组合。
 
-## 14. 结论
+## 15. 结论
 
 ms-swift 的 Activation CPU Offload 以 saved-tensor hooks 为切入点，建立了一个对模型透明、与 autograd 对齐的 activation 搬运框架。该框架通过 group commit 将层边界转化为调度锚点，并在异步实现中利用双 stream 和批量搬运机制降低传输对训练主路径的干扰。从工程角度看，它在 FSDP/FSDP2 训练中提供了一种有实际可用性的显存扩展手段；从设计角度看，其关键价值在于把“activation 生命周期管理”从模型实现中抽离出来，形成了机制层、策略层和集成层相互解耦的结构。
